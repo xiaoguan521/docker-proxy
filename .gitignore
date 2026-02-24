@@ -1,0 +1,4 @@
+.DS_Store
+.idea
+.vscode
+docker-proxy-linux-amd64

@@ -260,6 +260,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		handleToken(w, r)
 	case strings.HasPrefix(path, "/v2/"):
 		handleV2(w, r, hubHost, isDockerHub)
+	case path == "/health":
+		handleHealth(w)
 	default:
 		proxyDirect(w, r, hubHost)
 	}
@@ -320,6 +322,64 @@ func proxyBrowser(w http.ResponseWriter, r *http.Request, host string) {
 	defer resp.Body.Close()
 
 	flushResponse(w, resp)
+}
+
+// --- /health ---
+
+func handleHealth(w http.ResponseWriter) {
+	type checkResult struct {
+		Name    string `json:"name"`
+		URL     string `json:"url"`
+		Status  string `json:"status"`
+		Latency string `json:"latency"`
+		Detail  string `json:"detail,omitempty"`
+	}
+
+	checks := []struct {
+		name string
+		url  string
+	}{
+		{"auth.docker.io", "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull"},
+		{"registry-1.docker.io", "https://registry-1.docker.io/v2/"},
+		{"hub.docker.com", "https://hub.docker.com/"},
+	}
+
+	var results []checkResult
+	for _, c := range checks {
+		start := time.Now()
+		req, _ := http.NewRequest("GET", c.url, nil)
+		req.Header.Set("User-Agent", "docker-proxy/health-check")
+		resp, err := registryClient.Do(req)
+		elapsed := time.Since(start)
+
+		r := checkResult{
+			Name:    c.name,
+			URL:     c.url,
+			Latency: elapsed.Round(time.Millisecond).String(),
+		}
+		if err != nil {
+			r.Status = "FAIL"
+			r.Detail = err.Error()
+		} else {
+			resp.Body.Close()
+			r.Status = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			if resp.StatusCode < 500 {
+				r.Detail = "OK"
+			}
+		}
+		results = append(results, r)
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.Encode(map[string]any{
+		"proxy":  "running",
+		"time":   time.Now().Format(time.RFC3339),
+		"listen": listenAddr,
+		"checks": results,
+	})
 }
 
 // --- /v2/ ping ---
