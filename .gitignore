@@ -2,3 +2,4 @@
 .idea
 .vscode
 docker-proxy-linux-amd64
+docker-proxy-linux-arm64
