@@ -76,14 +76,14 @@ kill $(cat docker-proxy.pid)
 
 ## 🛠️ Docker 客户端配置与使用
 
-默认代理 Docker Hub。假设你的代理域名为 `docker.201807.xyz`：
+默认代理 Docker Hub。假设你的代理域名为 `docker.XXXXXX.xyz`：
 
 ### 方式一：配置 registry-mirrors (仅限 Docker Hub)
 
 编辑 `/etc/docker/daemon.json`：
 ```json
 {
-  "registry-mirrors": ["https://docker.201807.xyz"]
+  "registry-mirrors": ["https://docker.XXXXXX.xyz"]
 }
 ```
 重启 Docker daemon 后，日常的 `docker pull nginx` 将自动通过代理加速。
@@ -94,10 +94,10 @@ kill $(cat docker-proxy.pid)
 
 ```bash
 # 拉取 Docker Hub 官方源
-docker pull docker.201807.xyz/library/alpine:latest
+docker pull docker.XXXXXX.xyz/library/alpine:latest
 
 # 拉取其他用户源
-docker pull docker.201807.xyz/bitnami/redis:latest
+docker pull docker.XXXXXX.xyz/bitnami/redis:latest
 ```
 
 ## 🔐 登录私有仓库 & 拉取第三方库
@@ -115,13 +115,13 @@ docker pull docker.201807.xyz/bitnami/redis:latest
 **示例交互：登录 GHCR.io 并拉取私有包**
 ```bash
 # 使用你的 GitHub 用户名及 PAT (Personal Access Token) 登录
-$ docker login ghcr.docker.201807.xyz
+$ docker login ghcr.docker.XXXXXX.xyz
 Username: xiaoguan521
 Password: 
 Login Succeeded
 
 # 拉取关联的私有镜像
-$ docker pull ghcr.docker.201807.xyz/xiaoguan521/music-backend-node:latest
+$ docker pull ghcr.docker.XXXXXX.xyz/xiaoguan521/music-backend-node:latest
 ```
 
 ## 🩺 诊断与监控
@@ -130,7 +130,7 @@ $ docker pull ghcr.docker.201807.xyz/xiaoguan521/music-backend-node:latest
 访问 `/health` 端点，即可获取详尽的上游连通检测结果（代理自身会在内部向各个上游仓库发起通讯测试）：
 
 ```bash
-curl https://docker.201807.xyz/health
+curl https://docker.XXXXXX.xyz/health
 ```
 ```json
 {
