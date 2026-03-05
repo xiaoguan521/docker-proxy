@@ -224,7 +224,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case path == "/v2/" || path == "/v2":
-		handleV2Ping(w)
+		if isDockerHub {
+			handleV2Ping(w)
+		} else {
+			// 非 Docker Hub 仓库需要代理到上游，让真正的认证挑战传递给客户端
+			handleV2(w, r, hubHost, isDockerHub)
+		}
 	case strings.HasPrefix(path, "/_auth/"):
 		handleAuthProxy(w, r)
 	case strings.HasPrefix(path, "/v2/"):
