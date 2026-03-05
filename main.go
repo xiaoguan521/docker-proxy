@@ -12,7 +12,6 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -29,7 +28,6 @@ var (
 
 const (
 	dockerHub = "registry-1.docker.io"
-	authURL   = "https://auth.docker.io"
 )
 
 var routes = map[string]string{
@@ -49,8 +47,6 @@ var blockedUAs = []string{"netcraft"}
 var (
 	v2ShortPathRegex = regexp.MustCompile(`^/v2/[^/]+/[^/]+/[^/]+$`)
 	v2LibraryRegex   = regexp.MustCompile(`^/v2/library`)
-	repoExtractRegex = regexp.MustCompile(`^/v2/(.+?)(?:/(manifests|blobs|tags)/)`)
-	repoExtractList  = regexp.MustCompile(`^/v2/(.+?)/tags/list`)
 )
 
 // --- http clients ---
@@ -78,33 +74,6 @@ var downloadClient = &http.Client{
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 	},
-}
-
-// --- token cache ---
-
-type tokenEntry struct {
-	token   string
-	expires time.Time
-}
-
-var (
-	tokenCacheMu sync.RWMutex
-	tokenCache   = make(map[string]tokenEntry)
-)
-
-func getCachedToken(repo string) (string, bool) {
-	tokenCacheMu.RLock()
-	defer tokenCacheMu.RUnlock()
-	if e, ok := tokenCache[repo]; ok && time.Now().Before(e.expires) {
-		return e.token, true
-	}
-	return "", false
-}
-
-func setCachedToken(repo, token string, ttl time.Duration) {
-	tokenCacheMu.Lock()
-	defer tokenCacheMu.Unlock()
-	tokenCache[repo] = tokenEntry{token: token, expires: time.Now().Add(ttl)}
 }
 
 // --- main ---
@@ -256,8 +225,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/v2/" || path == "/v2":
 		handleV2Ping(w)
-	case strings.Contains(path, "/token"):
-		handleToken(w, r)
+	case strings.HasPrefix(path, "/_auth/"):
+		handleAuthProxy(w, r)
 	case strings.HasPrefix(path, "/v2/"):
 		handleV2(w, r, hubHost, isDockerHub)
 	case path == "/health":
@@ -393,10 +362,21 @@ func handleV2Ping(w http.ResponseWriter) {
 	w.Write([]byte("{}"))
 }
 
-// --- /token ---
+// --- auth proxy ---
+// 代理认证请求到上游认证服务，支持所有仓库
 
-func handleToken(w http.ResponseWriter, r *http.Request) {
-	target := authURL + r.URL.Path
+func handleAuthProxy(w http.ResponseWriter, r *http.Request) {
+	// 路径格式: /_auth/{auth-host}/remaining-path
+	trimmed := strings.TrimPrefix(r.URL.Path, "/_auth/")
+	slashIdx := strings.Index(trimmed, "/")
+	if slashIdx == -1 {
+		http.Error(w, "invalid auth path", http.StatusBadRequest)
+		return
+	}
+	authHost := trimmed[:slashIdx]
+	remainingPath := trimmed[slashIdx:]
+
+	target := fmt.Sprintf("https://%s%s", authHost, remainingPath)
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
@@ -406,18 +386,42 @@ func handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	req.Header.Set("Host", "auth.docker.io")
+	req.Header.Set("Host", authHost)
 	copySelectHeaders(req.Header, r.Header)
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
 
 	resp, err := registryClient.Do(req)
 	if err != nil {
-		log.Printf("token 代理失败: %v", err)
+		log.Printf("auth 代理失败 (%s): %v", authHost, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	flushResponse(w, resp)
+}
+
+// rewriteAuthHeader 将上游 401 响应中的 Www-Authenticate 认证地址改写为代理地址
+func rewriteAuthHeader(header string, r *http.Request, hubHost string) string {
+	scheme := "http"
+	if r.TLS != nil || tlsCert != "" {
+		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+	proxyBase := scheme + "://" + r.Host + "/_auth"
+
+	// Docker Hub: 认证服务在独立域名 auth.docker.io
+	result := strings.Replace(header, "https://auth.docker.io", proxyBase+"/auth.docker.io", -1)
+	// 通用仓库: 认证服务通常在同一域名
+	if hubHost != dockerHub {
+		result = strings.Replace(result, "https://"+hubHost, proxyBase+"/"+hubHost, -1)
+	}
+
+	return result
 }
 
 // --- /v2/<name>/... ---
@@ -454,21 +458,6 @@ func handleV2(w http.ResponseWriter, r *http.Request, hubHost string, isDockerHu
 		}
 	}
 
-	needsAuth := strings.Contains(path, "/manifests/") ||
-		strings.Contains(path, "/blobs/") ||
-		strings.Contains(path, "/tags/")
-
-	var token string
-	if needsAuth {
-		if repo := extractRepo(path); repo != "" {
-			var err error
-			token, err = getToken(repo)
-			if err != nil {
-				log.Printf("获取 token 失败 (repo=%s): %v", repo, err)
-			}
-		}
-	}
-
 	target := fmt.Sprintf("https://%s%s", hubHost, path)
 	if rawQuery != "" {
 		target += "?" + rawQuery
@@ -483,9 +472,7 @@ func handleV2(w http.ResponseWriter, r *http.Request, hubHost string, isDockerHu
 	copySelectHeaders(req.Header, r.Header)
 	req.Header.Set("Host", hubHost)
 
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	} else if auth := r.Header.Get("Authorization"); auth != "" {
+	if auth := r.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 	if v := r.Header.Get("X-Amz-Content-Sha256"); v != "" {
@@ -507,7 +494,11 @@ func handleV2(w http.ResponseWriter, r *http.Request, hubHost string, isDockerHu
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		log.Printf("上游 401 (path=%s)", path)
+		if authHeader := resp.Header.Get("Www-Authenticate"); authHeader != "" {
+			rewritten := rewriteAuthHeader(authHeader, r, hubHost)
+			resp.Header.Set("Www-Authenticate", rewritten)
+			log.Printf("认证重写: %s -> %s", authHeader, rewritten)
+		}
 	}
 
 	flushResponse(w, resp)
@@ -587,62 +578,6 @@ func proxyDirect(w http.ResponseWriter, r *http.Request, hubHost string) {
 	flushResponse(w, resp)
 }
 
-// --- token ---
-
-func extractRepo(path string) string {
-	if m := repoExtractRegex.FindStringSubmatch(path); len(m) > 1 {
-		return m[1]
-	}
-	if m := repoExtractList.FindStringSubmatch(path); len(m) > 1 {
-		return m[1]
-	}
-	return ""
-}
-
-func getToken(repo string) (string, error) {
-	if t, ok := getCachedToken(repo); ok {
-		return t, nil
-	}
-
-	tokenURL := fmt.Sprintf("%s/token?service=registry.docker.io&scope=repository:%s:pull", authURL, repo)
-	req, err := http.NewRequest("GET", tokenURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "docker-proxy/1.0")
-
-	resp, err := registryClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("auth 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("读取 token 失败: %w", err)
-	}
-
-	var result struct {
-		Token     string `json:"token"`
-		ExpiresIn int    `json:"expires_in"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("解析 token 失败: %w", err)
-	}
-	if result.Token == "" {
-		return "", fmt.Errorf("token 为空, resp=%s", string(body))
-	}
-
-	ttl := time.Duration(result.ExpiresIn) * time.Second
-	if ttl <= 0 || ttl > 300*time.Second {
-		ttl = 250 * time.Second
-	} else {
-		ttl -= 30 * time.Second
-	}
-	setCachedToken(repo, result.Token, ttl)
-	log.Printf("token 已缓存 (repo=%s, ttl=%s)", repo, ttl)
-	return result.Token, nil
-}
 
 // --- helpers ---
 
