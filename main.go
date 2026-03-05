@@ -595,6 +595,13 @@ func copySelectHeaders(dst, src http.Header) {
 			dst.Set(k, v)
 		}
 	}
+	// 将多个 Accept 合并（Docker 客户端可能发送多个 Accept 头支持 OCI 等）
+	if accepts := src.Values("Accept"); len(accepts) > 1 {
+		dst.Del("Accept")
+		for _, v := range accepts {
+			dst.Add("Accept", v)
+		}
+	}
 }
 
 func copyAllHeaders(dst, src http.Header) {
