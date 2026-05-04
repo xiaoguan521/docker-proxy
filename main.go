@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -95,7 +97,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", handleRequest)
+	mux.HandleFunc("/", logRequest(handleRequest))
 
 	server := &http.Server{
 		Addr:         listenAddr,
@@ -195,8 +197,6 @@ func isBlockedUA(ua string) bool {
 // --- main request router ---
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[%s] %s %s%s", r.RemoteAddr, r.Method, r.URL.Path, qstr(r))
-
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,TRACE,DELETE,HEAD,OPTIONS")
@@ -316,33 +316,45 @@ func handleHealth(w http.ResponseWriter) {
 		{"auth.docker.io", "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull"},
 		{"registry-1.docker.io", "https://registry-1.docker.io/v2/"},
 		{"hub.docker.com", "https://hub.docker.com/"},
+		{"ghcr.io", "https://ghcr.io/v2/"},
+		{"quay.io", "https://quay.io/v2/"},
 	}
 
-	var results []checkResult
-	for _, c := range checks {
-		start := time.Now()
-		req, _ := http.NewRequest("GET", c.url, nil)
-		req.Header.Set("User-Agent", "docker-proxy/health-check")
-		resp, err := registryClient.Do(req)
-		elapsed := time.Since(start)
+	results := make([]checkResult, len(checks))
+	var wg sync.WaitGroup
+	for i, c := range checks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-		r := checkResult{
-			Name:    c.name,
-			URL:     c.url,
-			Latency: elapsed.Round(time.Millisecond).String(),
-		}
-		if err != nil {
-			r.Status = "FAIL"
-			r.Detail = err.Error()
-		} else {
-			resp.Body.Close()
-			r.Status = fmt.Sprintf("HTTP %d", resp.StatusCode)
-			if resp.StatusCode < 500 {
-				r.Detail = "OK"
+			start := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
+			req.Header.Set("User-Agent", "docker-proxy/health-check")
+			resp, err := registryClient.Do(req)
+			elapsed := time.Since(start)
+
+			r := checkResult{
+				Name:    c.name,
+				URL:     c.url,
+				Latency: elapsed.Round(time.Millisecond).String(),
 			}
-		}
-		results = append(results, r)
+			if err != nil {
+				r.Status = "FAIL"
+				r.Detail = err.Error()
+			} else {
+				resp.Body.Close()
+				r.Status = fmt.Sprintf("HTTP %d", resp.StatusCode)
+				if resp.StatusCode < 500 {
+					r.Detail = "OK"
+				}
+			}
+			results[i] = r
+		}()
 	}
+	wg.Wait()
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -434,6 +446,11 @@ func rewriteAuthHeader(header string, r *http.Request, hubHost string) string {
 func handleV2(w http.ResponseWriter, r *http.Request, hubHost string, isDockerHub bool) {
 	path := r.URL.Path
 	rawQuery := r.URL.RawQuery
+	upstreamMethod := r.Method
+
+	if !isDockerHub && (path == "/v2/" || path == "/v2") && r.Method == http.MethodHead {
+		upstreamMethod = http.MethodGet
+	}
 
 	// Worker 逻辑: 如果 query 不含 %2F 但整体含 %3A, 在第一个 %3A 后插入 library%2F
 	if isDockerHub && !containsCI(rawQuery, "%2F") {
@@ -468,7 +485,7 @@ func handleV2(w http.ResponseWriter, r *http.Request, hubHost string, isDockerHu
 		target += "?" + rawQuery
 	}
 
-	req, err := http.NewRequest(r.Method, target, r.Body)
+	req, err := http.NewRequest(upstreamMethod, target, r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -583,13 +600,12 @@ func proxyDirect(w http.ResponseWriter, r *http.Request, hubHost string) {
 	flushResponse(w, resp)
 }
 
-
 // --- helpers ---
 
 func copySelectHeaders(dst, src http.Header) {
 	for _, k := range []string{
 		"User-Agent", "Accept", "Accept-Language", "Accept-Encoding",
-		"Connection", "Cache-Control", "If-None-Match", "If-Modified-Since",
+		"Cache-Control", "If-None-Match", "If-Modified-Since",
 	} {
 		if v := src.Get(k); v != "" {
 			dst.Set(k, v)
@@ -654,6 +670,36 @@ func qstr(r *http.Request) string {
 		return "?" + r.URL.RawQuery
 	}
 	return ""
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+func logRequest(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next(rec, r)
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		log.Printf("[%s] %s %s%s -> %d (%s)", r.RemoteAddr, r.Method, r.URL.Path, qstr(r), status, time.Since(start).Round(time.Millisecond))
+	}
 }
 
 // --- pages ---

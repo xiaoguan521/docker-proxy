@@ -46,6 +46,13 @@ chmod +x docker-proxy-linux-amd64
 kill $(cat docker-proxy.pid)
 ```
 
+也可以使用 Docker Compose 部署，默认只绑定本机 `127.0.0.1:5000`，适合放在 Nginx Proxy Manager 后面：
+
+```bash
+docker compose up -d --build
+curl http://127.0.0.1:5000/health
+```
+
 **命令行参数：**
 | 参数 | 默认值 | 说明 |
 |---|---|---|
@@ -127,7 +134,7 @@ $ docker pull ghcr.docker.XXXXXX.xyz/xiaoguan521/music-backend-node:latest
 ## 🩺 诊断与监控
 
 **系统连通性检查**
-访问 `/health` 端点，即可获取详尽的上游连通检测结果（代理自身会在内部向各个上游仓库发起通讯测试）：
+访问 `/health` 端点，即可获取详尽的上游连通检测结果（代理自身会在内部向 Docker Hub、GHCR、Quay 等上游仓库发起通讯测试）：
 
 ```bash
 curl https://docker.XXXXXX.xyz/health
@@ -138,10 +145,22 @@ curl https://docker.XXXXXX.xyz/health
   "time": "2026-03-05T06:50:00Z",
   "checks": [
     {"name": "auth.docker.io", "status": "HTTP 200", "latency": "66ms"},
-    {"name": "registry-1.docker.io", "status": "HTTP 401", "latency": "13ms"}
+    {"name": "registry-1.docker.io", "status": "HTTP 401", "latency": "13ms"},
+    {"name": "ghcr.io", "status": "HTTP 401", "latency": "18ms"}
   ]
 }
 ```
+
+> `/health` 只能证明代理服务器到上游仓库的连通性。排查登录或私有镜像拉取时，还需要单独验证公网域名下的 `/_auth/...` 链路是否能穿过 Nginx Proxy Manager 到达本服务。
+
+## ✅ 开发与验证
+
+```bash
+go test ./...
+go vet ./...
+```
+
+Release 会同时上传四个平台的二进制文件和 `checksums.txt`，下载后可用 `sha256sum -c checksums.txt` 校验。
 
 ## 🏗️ 架构对比：相比 Cloudflare Workers 版本的优势
 

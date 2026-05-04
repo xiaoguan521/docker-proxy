@@ -35,6 +35,7 @@ jobs:
             echo "Building ${output}..."
             CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "$output" .
           done
+          (cd dist && sha256sum docker-proxy-* > checksums.txt)
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
